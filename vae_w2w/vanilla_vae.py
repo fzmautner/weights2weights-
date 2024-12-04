@@ -22,12 +22,19 @@ class VanillaVAE(nn.Module):
         in_dim = input_dim
         # Build Encoder
         for h_dim in hidden_dims:
-            modules.append(
-                nn.Sequential(
-                    nn.Linear(in_dim, h_dim),
-                    # nn.BatchNorm2d(h_dim),
-                    nn.LeakyReLU())
-            )
+            if kwargs['batch_norm']:
+                modules.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, h_dim),
+                        nn.BatchNorm1d(h_dim),
+                        nn.LeakyReLU())
+                )
+            else:
+                modules.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, h_dim),
+                        nn.LeakyReLU())
+                )
             in_dim = h_dim
 
         self.encoder = nn.Sequential(*modules)
@@ -42,18 +49,30 @@ class VanillaVAE(nn.Module):
         hidden_dims.reverse()
 
         for i in range(len(hidden_dims) - 1):
-            modules.append(
-                nn.Sequential(
-                    nn.Linear(hidden_dims[i], hidden_dims[i + 1]),
-                    # nn.BatchNorm2d(hidden_dims[i + 1]),
-                    nn.LeakyReLU())
-            )
+            if kwargs['batch_norm']:
+                modules.append(
+                    nn.Sequential(
+                        nn.Linear(hidden_dims[i], hidden_dims[i + 1]),
+                        nn.BatchNorm1d(hidden_dims[i + 1]),
+                        nn.LeakyReLU())
+                )
+            else:
+                modules.append(
+                    nn.Sequential(
+                        nn.Linear(hidden_dims[i], hidden_dims[i + 1]),
+                        nn.LeakyReLU())
+                )
 
         self.decoder = nn.Sequential(*modules)
 
+        # if kwargs['batch_norm']:
+        #     self.final_layer = nn.Sequential(
+        #                     nn.Linear(hidden_dims[-1], input_dim),
+        #                     nn.BatchNorm1d(hidden_dims[-1]),
+        #                     nn.Tanh())
+        # else:
         self.final_layer = nn.Sequential(
                             nn.Linear(hidden_dims[-1], input_dim),
-                            # nn.BatchNorm2d(hidden_dims[-1]),
                             nn.Tanh())
 
     
