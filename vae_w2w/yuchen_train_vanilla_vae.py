@@ -13,7 +13,7 @@ import random
 import argparse
 
 from vanilla_vae import VanillaVAE
-from yuchen_vae import YuchenVAE
+from yuchen_vae import YuchenVAE, YuchenDiscriminator
 
 sys.path.append('../')
 from lora_w2w import LoRAw2w
@@ -23,8 +23,6 @@ from peft.utils.save_and_load import load_peft_weights
 from PIL import Image
 
 from utils import unflatten
-
-
 
 def init_training(cfg, args=None):
     
@@ -72,9 +70,13 @@ def init_training(cfg, args=None):
 MIN = -0.094693
 RANGE = 0.186591
 def normalize_weights(weights):
-    return (weights - MIN) / RANGE
+    weights = (weights - MIN) / RANGE
+    weights = weights * 2 - 1
+    return weights
 def denormalize_weights(weights):
-    return weights * RANGE + MIN
+    weights = (weights + 1) / 2
+    weights = weights * RANGE + MIN
+    return weights
 
 def save_model_architecture(model, directory: str, model_name='model') -> None:
     """Save the model architecture to a `.txt` file."""
@@ -200,10 +202,22 @@ def main(cfg, args=None):
             blocks=model_cfg.vae.blocks
         ).to(device)
     save_model_architecture(vae, export_path, model_name='vae')
-
+    use_discriminator = model_cfg.use_discriminator
+    if use_discriminator:
+        print("[WARNING] Using Discriminator")
+        discriminator = YuchenDiscriminator(
+                input_dim=in_dim,
+                hidden_dim=model_cfg.discriminator.hidden_dim,
+                blocks=model_cfg.discriminator.blocks
+            ).to(device)
+        save_model_architecture(discriminator, export_path, model_name='discriminator')
+    else:
+        print("[WARNING] Not using Discriminator")
+    
     # Initialize the optimizer
-    vae_optimizer = torch.optim.Adam(vae.parameters(), lr=train_cfg.lr)
-
+    vae_optimizer = torch.optim.Adam(vae.parameters(), lr=train_cfg.lr * 10)
+    discriminator_optimizer = torch.optim.Adam(discriminator.parameters(), lr=train_cfg.lr)
+    
     # Train!
     epochs = train_cfg.epochs
     for epoch in range(epochs):
@@ -211,30 +225,51 @@ def main(cfg, args=None):
         vae.train()
         bar = tqdm(train_loader, desc=f"Epoch[{epoch}/{epochs}]")
         for i, weights in enumerate(bar):
-
-            vae_optimizer.zero_grad()
             
             # vae forward
             recon, mu, log_var = vae(weights)
             vae_losses = vae.loss(weights, recon, mu, log_var, beta=model_cfg.vae.kl_beta)
             vae_loss, vae_recon_loss, vae_kl_loss = vae_losses['loss'], vae_losses['recon_loss'], vae_losses['kl_loss']
             
-            # get loss
-            loss = vae_loss / len(weights)
-            loss.backward()
-            
+            # get generator loss
+            gen_loss = vae_loss
+            if use_discriminator:
+                g_loss, _ = discriminator(recon, label=True)
+                gen_loss = gen_loss + model_cfg.discriminator.dis_beta * g_loss
+            gen_loss = gen_loss / len(weights)
+            vae_optimizer.zero_grad()
+            gen_loss.backward()
             vae_optimizer.step()
             
+            if use_discriminator:
+                # get discriminator loss
+                discriminator_losses = discriminator.get_discriminator_losses(weights, recon)
+                dis_loss, real_loss, fake_loss = discriminator_losses['loss'], discriminator_losses['real_loss'], discriminator_losses['fake_loss']
+                dis_loss = dis_loss / len(weights) * model_cfg.discriminator.dis_beta
+                discriminator_optimizer.zero_grad()
+                dis_loss.backward()
+                discriminator_optimizer.step()
+                
             # log
             loss_log = {
-                'loss': loss.item(),
+                'gen_loss': gen_loss.item(), 
                 'recon_loss': vae_recon_loss.item(),
-                'kl_loss': vae_kl_loss.item()
+                'kl_loss': vae_kl_loss.item(), 
             }
+            if use_discriminator:
+                loss_log.update({
+                    'g_loss': g_loss.item(),
+                    'dis_loss': dis_loss.item(),
+                    'real_loss': real_loss.item(),
+                    'fake_loss': fake_loss.item()
+                })
             bar.set_postfix(loss_log)
             wandb.log(loss_log)
             with open(os.path.join(export_path, 'log.txt'), 'a') as f:
-                f.write(f"Epoch {epoch:03d} Iter {i:03d} Loss {loss.item():.6f} Recon Loss {vae_recon_loss.item():.6f} KL Loss {vae_kl_loss.item():.6f}\n")
+                if use_discriminator:
+                    f.write(f"Epoch {epoch:03d} Iter {i:03d} Gen Loss {gen_loss.item():.6f} G Loss {g_loss.item():.6f} Recon Loss {vae_recon_loss.item():.6f} KL Loss {vae_kl_loss.item():.6f} Dis Loss {dis_loss.item():.6f} Real Loss {real_loss.item():.6f} Fake Loss {fake_loss.item():.6f}\n")
+                else:
+                    f.write(f"Epoch {epoch:03d} Iter {i:03d} Gen Loss {gen_loss.item():.6f} Recon Loss {vae_recon_loss.item():.6f} KL Loss {vae_kl_loss.item():.6f}\n")
 
         # Evaluate 
         vae.eval()
@@ -252,7 +287,7 @@ def main(cfg, args=None):
             with open(os.path.join(export_path, 'log.txt'), 'a') as f:
                 f.write(f"Epoch {epoch:03d} Test Loss {test_loss:.6f}\n")
             
-            if epoch == 0 or (epoch + 1) % train_cfg.inference_interval == 0:
+            if epoch != 0 and (epoch + 1) % train_cfg.inference_interval == 0:
                 # inference
                 print(f"Epoch[{epoch}/{epochs}] Inference")
                 gt_inference_weight = all_weights[random.choice(range(len(all_weights)))].to(device)
@@ -283,12 +318,14 @@ def main(cfg, args=None):
                     "recon_images": [wandb.Image(img) for img in recon_images]
                 })
             
-        if epoch == 0 or (epoch + 1) % train_cfg.save_interval == 0:
+        if epoch != 0 and (epoch + 1) % train_cfg.save_interval == 0:
             print(f"Saving checkpoint at epoch {epoch}")
             checkpoint_path = os.path.join(export_path, 'checkpoints', f'epoch_{epoch:03d}.pt')
             checkpoint = {
                 'vae_state_dict': vae.state_dict(),
                 'vae_optimizer_state_dict': vae_optimizer.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict() if use_discriminator else None,
+                'discriminator_optimizer_state_dict': discriminator_optimizer.state_dict() if use_discriminator else None,
                 'epoch': epoch
             }
             torch.save(checkpoint, checkpoint_path)

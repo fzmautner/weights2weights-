@@ -56,8 +56,8 @@ class YuchenDiscriminator(nn.Module):
     def loss(self, x, y):
         return F.binary_cross_entropy_with_logits(x, y)
     
-    def forward(self, x, is_real):
-        if is_real:
+    def forward(self, x, label):
+        if label:
             labels = torch.ones(x.size(0), 1).to(x.device)
         else:
             labels = torch.zeros(x.size(0), 1).to(x.device)
@@ -65,6 +65,17 @@ class YuchenDiscriminator(nn.Module):
         preds = self.predict(x)
         loss = self.loss(preds, labels)
         return loss, preds
+    
+    def get_discriminator_losses(self, gt, recon):
+        
+        real_loss, _ = self(gt, True)
+        fake_loss, _ = self(recon.detach(), False)
+        
+        return {
+            'loss': real_loss + fake_loss,
+            'real_loss': real_loss,
+            'fake_loss': fake_loss
+        }
                       
     
 class YuchenVAE(nn.Module):

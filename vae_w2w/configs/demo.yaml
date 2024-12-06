@@ -1,20 +1,29 @@
 train:
+  seed: 0
   export_path: 
   train_tag:
-  gpu: 0
+  gpu: 1
   epochs: 15
-  lr: 1e-4
+  lr: 1e-5
   batch_size: 256
   save_interval: 5
+  inference_interval: 5
   train_ratio: 0.8
+  inference_num: 10
 
 data:
   normalize: True
   weights_path: "./data/all_weights.pt"
+  weight_dimensions_path: "./data/weight_dimensions.pt"
 
 model:
+  use_discriminator: True
   vae:
     latent_dim: 1024
     hidden_dim: 1024
-    blocks: 1
+    blocks: 4
     kl_beta: 0.1
+  discriminator:
+    hidden_dim: 512
+    blocks: 2
+    dis_beta: 0.1
