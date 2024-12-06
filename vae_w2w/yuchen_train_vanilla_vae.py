@@ -7,42 +7,58 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
 from torch import nn
-from vanilla_vae import VanillaVAE
-from yuchen_vae import YuchenVAE
 import wandb
 from tqdm import tqdm
-device = "cuda:0"
+from omegaconf import OmegaConf
+import time
+import random
+import argparse
 
+from vanilla_vae import VanillaVAE
+from yuchen_vae import YuchenVAE
 
-# some flag for training and debugging
-normalize_by_10 = True
-batch_norm = True
-run_name = "vanilla-vae-normalizeby10-batchnorm-biggerhidden_dims-epoch15#1"
-wandb_flag = True
-
-# latent_dim = 32
-# hidden_dims = [1024, 512, 256, 128, 64]
-latent_dim = 128
-hidden_dims = [4096, 2048, 1024, 512, 256]
-epochs = 15
-learning_rate = 1e-4
-
-if wandb_flag:
-    wandb.init(
-            project="w2w-proj",
-            name=run_name,
-        )
-
-weights_path = '../all_weights.pt'
-all_weights = torch.load(weights_path, map_location=torch.device("cpu"))
-print(f"all_weights shape: {all_weights.shape}")
-
-tensor = all_weights[0]
-size_in_bytes = tensor.element_size() * tensor.numel()
-
-# Convert to gigabytes
-size_in_gb = size_in_bytes / (1024 ** 3)
-print(f"Size of the all_weights in GB: {size_in_gb * len(all_weights):.6f} GB")
+def init_training(cfg, args=None):
+    
+    # get export folder
+    export_path = cfg.train.export_path if cfg.train.export_path else './outputs'
+    if cfg.train.train_tag is None:
+        cfg.train.train_tag = time.strftime("%Y%m%d_%H_%M_%S")
+    export_path = os.path.join(export_path, cfg.train.train_tag)
+    if os.path.exists(export_path):
+        if args is not None and not args.overwrite:
+            overwrite = input(f'Warning: export path {export_path} already exists. Exit?(y/n)')
+            if overwrite.lower() == 'y':
+                exit()
+    else:
+        os.makedirs(export_path)
+        os.makedirs(os.path.join(export_path, 'images'))
+        os.makedirs(os.path.join(export_path, 'checkpoints'))
+    
+    # set seed
+    seed = cfg.train.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # init torch
+    device = f'cuda:{cfg.train.gpu}'
+    torch_device = torch.device(device)
+    torch.cuda.set_device(cfg.train.gpu)
+    torch.backends.cudnn.benchmark = False
+    print(f'\nusing device: {device}\n')
+    
+    # init wandb
+    wandb.init(project="w2w-proj", name=cfg.train.train_tag)
+    
+    # export config
+    print(f'exporting to: {export_path}\n')
+    with open(os.path.join(export_path, 'config.yaml'), 'w') as f:
+        f.write(OmegaConf.to_yaml(cfg, resolve=True))
+    
+    return torch_device, export_path
 
 class w2wDataset(Dataset):
     def __init__(self, all_weights):
@@ -52,98 +68,135 @@ class w2wDataset(Dataset):
         return len(self.all_weights)
     
     def __getitem__(self, idx):
-        if normalize_by_10:
-            return self.all_weights[idx] * 10
         return self.all_weights[idx]
+
+def main(cfg, args=None):
     
-train_ratio = 0.8
-test_ratio = 0.1
-val_ratio = 0.1
-batch_size = 32
+    train_cfg = cfg.train
+    data_cfg = cfg.data
+    model_cfg = cfg.model
+    
+    # init training
+    device, export_path = init_training(cfg, args)
 
-# Calculate the sizes of the splits
-train_size = int(train_ratio * len(all_weights))
-test_size = int(test_ratio * len(all_weights))
-val_size = len(all_weights) - train_size - test_size
+    # load data
+    weights_path = data_cfg.weights_path
+    all_weights = torch.load(weights_path, map_location=torch.device('cpu'))
+    print(f"all_weights shape: {all_weights.shape}")
 
-# Split the dataset
-full_dataset = w2wDataset(all_weights)
-train_dataset, test_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size, val_size])
+    if data_cfg.normalize:
+        print("Normalizing the weights")
+        print(f"Min: {all_weights.min()}")
+        print(f"Max-Min: {all_weights.max() - all_weights.min()}")
+        all_weights = (all_weights - all_weights.min()) / (all_weights.max() - all_weights.min()) # [0, 1]
+        all_weights = all_weights * 2 - 1 # [-1, 1]
 
-# Create the dataloaders
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    all_weights = all_weights.to(device)
 
-in_dim = len(all_weights[0])
-# latent_dim = 32
-# hidden_dims = [1024, 512, 256, 128, 64]
+    tensor = all_weights[0]
+    size_in_bytes = tensor.element_size() * tensor.numel()
+    size_in_gb = size_in_bytes / (1024 ** 3)
+    print(f"Size of the all_weights in GB: {size_in_gb * len(all_weights):.6f} GB")
 
-vae = YuchenVAE(
-        input_dim=in_dim,
-        latent_dim=latent_dim,
-    ).to(device)
-vae.train()
+    # Split the dataset
+    
+    train_ratio = train_cfg.train_ratio
+    batch_size = train_cfg.batch_size
+    train_size = int(train_ratio * len(all_weights))
+    test_size = len(all_weights) - train_size
+    
+    full_dataset = w2wDataset(all_weights)
+    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size])
 
-def evaluate(dataloader, dataname, vae):
-    size = len(dataloader.dataset)
-    vae.eval()
-    avg_loss = 0
-    with torch.no_grad():
-        for weights in dataloader:
-            weights = weights.to(device)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    in_dim = len(all_weights[0])
+
+    # Initialize the model
+    vae = YuchenVAE(
+            input_dim=in_dim,
+            latent_dim=model_cfg.vae.latent_dim,
+            hidden_dim=model_cfg.vae.hidden_dim,
+            blocks=model_cfg.vae.blocks
+        ).to(device)
+
+    # Initialize the optimizer
+    vae_optimizer = torch.optim.Adam(vae.parameters(), lr=train_cfg.lr)
+
+    # Train!
+    epochs = train_cfg.epochs
+    for epoch in range(epochs):
+        
+        vae.train()
+        bar = tqdm(train_loader, desc=f"Epoch[{epoch}/{epochs}]")
+        for i, weights in enumerate(bar):
+
+            vae_optimizer.zero_grad()
+            
+            # vae forward
             recon, mu, log_var = vae(weights)
-            avg_loss += vae.loss(weights, recon, mu, log_var)['loss'].item()
-    avg_loss /= size
-    print(f"{dataname} avg loss = {avg_loss:>8f}")
-    return avg_loss
+            vae_losses = vae.loss(weights, recon, mu, log_var, beta=model_cfg.vae.kl_beta)
+            vae_loss, vae_recon_loss, vae_kl_loss = vae_losses['loss'], vae_losses['recon_loss'], vae_losses['kl_loss']
+            
+            # get loss
+            loss = vae_loss / len(weights)
+            loss.backward()
+            
+            vae_optimizer.step()
+            
+            # log
+            loss_log = {
+                'loss': loss.item(),
+                'recon_loss': vae_recon_loss.item(),
+                'kl_loss': vae_kl_loss.item()
+            }
+            bar.set_postfix(loss_log)
+            wandb.log(loss_log)
+            with open(os.path.join(export_path, 'log.txt'), 'a') as f:
+                f.write(f"Epoch {epoch:03d} Iter {i:03d} Loss {loss.item():.6f} Recon Loss {vae_recon_loss.item():.6f} KL Loss {vae_kl_loss.item():.6f}\n")
 
-
-# epochs = 5
-optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
-
-vae_save_path = "./outputs/"+run_name+"/"
-os.makedirs(vae_save_path, exist_ok=True)
-# Training loop
-for epoch in range(epochs):
-    vae.train()
-    cur_num_examples = 0
-    bar = tqdm(train_loader, desc=f"Epoch[{epoch}/{epochs}]")
-    for i, weights in enumerate(bar):
-        weights = weights.to(device)
-        optimizer.zero_grad()
-        recon, mu, log_var = vae(weights)
+        # Evaluate 
+        vae.eval()
+        with torch.no_grad():
+            test_loss = 0
+            for i, weights in enumerate(test_loader):
+                recon, mu, log_var = vae(weights)
+                vae_losses = vae.loss(weights, recon, mu, log_var, beta=model_cfg.vae.kl_beta)
+                vae_loss, vae_recon_loss, vae_kl_loss = vae_losses['loss'], vae_losses['recon_loss'], vae_losses['kl_loss']
+                loss = vae_loss / len(weights)
+                test_loss += loss.item()
+            test_loss /= len(test_loader)
+            wandb.log({"Test Loss": test_loss})
+            with open(os.path.join(export_path, 'log.txt'), 'a') as f:
+                f.write(f"Epoch {epoch:03d} Test Loss {test_loss:.6f}\n")
         
-        loss = vae.loss(weights, recon, mu, log_var)
-        loss['loss'].backward()
-        optimizer.step()
+        if epoch == 0 or (epoch + 1) % train_cfg.save_interval == 0:
+            checkpoint_path = os.path.join(export_path, 'checkpoints', f'epoch_{epoch}.pt')
+            checkpoint = {
+                'vae_state_dict': vae.state_dict(),
+                'vae_optimizer_state_dict': vae_optimizer.state_dict(),
+                'epoch': epoch
+            }
+            torch.save(checkpoint, checkpoint_path)
         
-        bar.set_postfix(loss=loss['loss'].item())
-        
-        cur_num_examples += weights.shape[0]
-        if wandb_flag:
-            wandb.log(loss)
 
-    train_avg_loss = evaluate(train_loader, "Train", vae)
-    test_avg_loss = evaluate(test_loader, "Test", vae)
-    val_avg_loss = evaluate(val_loader, "Validation", vae)
 
-    if wandb_flag:
-        wandb.log({"Epoch": epoch,
-                    "Train Avg Loss": train_avg_loss, 
-                    "Test Avg Loss": test_avg_loss,
-                    "Validation Avg Loss": val_avg_loss,})
+if __name__ == "__main__":
     
-    if epoch != 0 and (epoch+1) % 5 == 0:
-        checkpoint_path = "./outputs/"+run_name+"/"+f"vae_checkpoint_epoch{epoch}.pt"
-        checkpoint = {
-            'model_state_dict': vae.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'epoch': epoch
-        }
-        torch.save(checkpoint, checkpoint_path)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--tag", type=str)
     
-
-# save model
-
-torch.save(vae.state_dict(), vae_save_path+"vae.pt")
+    args = parser.parse_args()
+    cfg = OmegaConf.load(args.config)
+    print(OmegaConf.to_yaml(cfg, resolve=True))
+    
+    if args.gpu is not None:
+        cfg.train.gpu = args.gpu
+    if args.tag is not None:
+        cfg.train.train_tag = args.tag
+    
+    main(cfg, args)

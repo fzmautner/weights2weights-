@@ -28,7 +28,7 @@ class YuchenVAE(nn.Module):
                  input_dim: int,
                  latent_dim: int,
                  hidden_dim: int = 1024,
-                 blocks: int = 4,
+                 blocks: int = 1,
                  **kwargs) -> None:
         super(YuchenVAE, self).__init__()
 
@@ -117,8 +117,9 @@ class YuchenVAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return  [self.decode(z), mu, log_var]
 
-    def loss(self, x, x_recon, mu, log_var, beta=1.0):
+    def loss(self, x, x_recon, mu, log_var, beta=0.1):
         recon_loss = F.mse_loss(x_recon, x)
+        # recon_loss = F.l1_loss(x_recon, x, reduction='mean')
         kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
         loss = recon_loss + beta * kl_loss
         return {
@@ -126,34 +127,6 @@ class YuchenVAE(nn.Module):
             'recon_loss': recon_loss,
             'kl_loss': kl_loss
         }
-    
-    # def loss_function(self,
-    #                   *args,
-    #                   **kwargs) -> dict:
-    #     """
-    #     Computes the VAE loss function.
-    #     KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
-    #     :param args:
-    #     :param kwargs:
-    #     :return:
-    #     """
-    #     recons = args[0]
-    #     input = args[1]
-    #     mu = args[2]
-    #     log_var = args[3]
-
-    #     kld_weight = kwargs['M_N'] # Account for the minibatch samples from the dataset
-    #     recons_loss =F.mse_loss(recons, input)
-
-
-    #     kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
-    #     loss = recons_loss + kld_weight * kld_loss
-    #     return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(), 'KLD':-kld_loss.detach()}
-
-    # def sample(self, num_samples):
-    #     z = torch.randn(num_samples, self.latent_dim)
-    #     return self.decode(z)
     
     def sample(self,
                num_samples:int,

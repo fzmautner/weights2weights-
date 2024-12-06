@@ -1,3 +1,8 @@
 data
 *.ipynb
 log
+all_weights.pt
+__pycache__
+wandb
+outputs
+weight_dimensions.pt
