@@ -1,12 +1,10 @@
 import sys
 import os 
-import pandas as pd
+import shutil
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
-from torch import nn
 import wandb
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -16,6 +14,17 @@ import argparse
 
 from vanilla_vae import VanillaVAE
 from yuchen_vae import YuchenVAE
+
+sys.path.append('../')
+from lora_w2w import LoRAw2w
+from diffusers import DiffusionPipeline
+from peft import PeftModel
+from peft.utils.save_and_load import load_peft_weights
+from PIL import Image
+
+from utils import unflatten
+
+
 
 def init_training(cfg, args=None):
     
@@ -60,6 +69,22 @@ def init_training(cfg, args=None):
     
     return torch_device, export_path
 
+MIN = -0.094693
+RANGE = 0.186591
+def normalize_weights(weights):
+    return (weights - MIN) / RANGE
+def denormalize_weights(weights):
+    return weights * RANGE + MIN
+
+def save_model_architecture(model, directory: str, model_name='model') -> None:
+    """Save the model architecture to a `.txt` file."""
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    message = f'Number of trainable / all parameters: {num_trainable_params} / {num_params}\n\n' + str(model)
+
+    with open(os.path.join(directory, f'{model_name}.txt'), 'w') as f:
+        f.write(message)
+
 class w2wDataset(Dataset):
     def __init__(self, all_weights):
         self.all_weights = all_weights
@@ -69,6 +94,61 @@ class w2wDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.all_weights[idx]
+    
+def inference(
+    weight, 
+    weight_dimensions,
+    export_path, 
+    inference_num: 10,
+    denormalize=False
+):  
+    if denormalize:
+        weight = denormalize_weights(weight)
+    if len(weight.shape) == 1:
+        weight = weight.unsqueeze(0)
+    # create unet weight
+    unet_path = os.path.join(export_path, 'unet')
+    if os.path.exists(unet_path):
+        shutil.rmtree(unet_path)
+    unflatten(weight, weight_dimensions, export_path)
+    
+    # load pipe
+    device = weight.device
+    pipe = DiffusionPipeline.from_pretrained(
+        "stablediffusionapi/realistic-vision-v51", 
+        torch_dtype=torch.float16,
+        safety_checker = None,
+        requires_safety_checker = False
+    )
+    pipe.unet = PeftModel.from_pretrained(pipe.unet, unet_path, adapter_name="identity1")
+    adapters_weights1 = load_peft_weights(unet_path)
+    pipe.unet.load_state_dict(adapters_weights1, strict = False)
+    pipe.to(device)
+    
+    # generate
+    prompts = ["sks person"] * inference_num
+    negative_prompts = ["low quality, blurry, unfinished"] * inference_num
+    generators = [torch.Generator(device=device).manual_seed(i) for i in range(inference_num)]
+    guidance_scale = 3.0
+    ddim_steps = 50
+    images = pipe(
+        prompts, 
+        num_inference_steps=ddim_steps, 
+        guidance_scale=guidance_scale, 
+        negative_prompt=negative_prompts,
+        generator=generators
+    ).images
+
+    ### display images
+    w, h = 512,512
+    grid = Image.new('RGB', size=(5*512, 2*512))
+    grid_w, grid_h = grid.size
+    for i, img in enumerate(images):
+        grid.paste(img, box=(i%5*w, i//5*h))
+    
+    return images, grid
+
+   
 
 def main(cfg, args=None):
     
@@ -83,13 +163,12 @@ def main(cfg, args=None):
     weights_path = data_cfg.weights_path
     all_weights = torch.load(weights_path, map_location=torch.device('cpu'))
     print(f"all_weights shape: {all_weights.shape}")
+    # load weight dimensions
+    weight_dimensions = torch.load(data_cfg.weight_dimensions_path)
 
     if data_cfg.normalize:
         print("Normalizing the weights")
-        print(f"Min: {all_weights.min()}")
-        print(f"Max-Min: {all_weights.max() - all_weights.min()}")
-        all_weights = (all_weights - all_weights.min()) / (all_weights.max() - all_weights.min()) # [0, 1]
-        all_weights = all_weights * 2 - 1 # [-1, 1]
+        all_weights = normalize_weights(all_weights)
 
     all_weights = all_weights.to(device)
 
@@ -120,6 +199,7 @@ def main(cfg, args=None):
             hidden_dim=model_cfg.vae.hidden_dim,
             blocks=model_cfg.vae.blocks
         ).to(device)
+    save_model_architecture(vae, export_path, model_name='vae')
 
     # Initialize the optimizer
     vae_optimizer = torch.optim.Adam(vae.parameters(), lr=train_cfg.lr)
@@ -167,12 +247,45 @@ def main(cfg, args=None):
                 loss = vae_loss / len(weights)
                 test_loss += loss.item()
             test_loss /= len(test_loader)
+            print(f"Epoch[{epoch}/{epochs}] Test Loss: {test_loss:.6f}")
             wandb.log({"Test Loss": test_loss})
             with open(os.path.join(export_path, 'log.txt'), 'a') as f:
                 f.write(f"Epoch {epoch:03d} Test Loss {test_loss:.6f}\n")
-        
+            
+            if epoch == 0 or (epoch + 1) % train_cfg.inference_interval == 0:
+                # inference
+                print(f"Epoch[{epoch}/{epochs}] Inference")
+                gt_inference_weight = all_weights[random.choice(range(len(all_weights)))].to(device)
+                recon_inference_weight = vae(gt_inference_weight)[0]
+                print(f"recon_loss: {torch.nn.functional.mse_loss(gt_inference_weight, recon_inference_weight).item()}")
+                # inference ground truth weights
+                gt_images, gt_grid = inference(
+                    gt_inference_weight, 
+                    weight_dimensions, 
+                    export_path, 
+                    inference_num=train_cfg.inference_num,
+                    denormalize=data_cfg.normalize
+                )
+                # inference reconstructed weights
+                recon_images, recon_grid = inference(
+                    recon_inference_weight, 
+                    weight_dimensions, 
+                    export_path, 
+                    inference_num=train_cfg.inference_num,
+                    denormalize=data_cfg.normalize
+                )
+                # save grid
+                gt_grid.save(os.path.join(export_path, 'images', f'epoch_{epoch:03d}_gt.png'))
+                recon_grid.save(os.path.join(export_path, 'images', f'epoch_{epoch:03d}_recon.png'))
+                # log images
+                wandb.log({
+                    "gt_images": [wandb.Image(img) for img in gt_images],
+                    "recon_images": [wandb.Image(img) for img in recon_images]
+                })
+            
         if epoch == 0 or (epoch + 1) % train_cfg.save_interval == 0:
-            checkpoint_path = os.path.join(export_path, 'checkpoints', f'epoch_{epoch}.pt')
+            print(f"Saving checkpoint at epoch {epoch}")
+            checkpoint_path = os.path.join(export_path, 'checkpoints', f'epoch_{epoch:03d}.pt')
             checkpoint = {
                 'vae_state_dict': vae.state_dict(),
                 'vae_optimizer_state_dict': vae_optimizer.state_dict(),

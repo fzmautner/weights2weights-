@@ -21,7 +21,51 @@ class ResidualBlock(nn.Module):
         
     def forward(self, x):
         return x + self.block(x)
+
+class YuchenDiscriminator(nn.Module):
+    
+    def __init__(self, 
+                 input_dim: int, 
+                 hidden_dim: int = 1024,
+                 blocks: int = 1,
+    ):
+        super(YuchenDiscriminator, self).__init__()
         
+        self.first_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.ReLU(), 
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(hidden_dim, hidden_dim // 2) for _ in range(blocks)]
+        )
+        
+        self.final_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(), 
+            nn.Linear(hidden_dim * 2, 1),
+        )
+    
+    def predict(self, x):
+        x = self.first_layer(x)
+        x = self.blocks(x)
+        x = self.final_layer(x)
+        return x
+    
+    def loss(self, x, y):
+        return F.binary_cross_entropy_with_logits(x, y)
+    
+    def forward(self, x, is_real):
+        if is_real:
+            labels = torch.ones(x.size(0), 1).to(x.device)
+        else:
+            labels = torch.zeros(x.size(0), 1).to(x.device)
+            
+        preds = self.predict(x)
+        loss = self.loss(preds, labels)
+        return loss, preds
+                      
     
 class YuchenVAE(nn.Module):
     def __init__(self,
