@@ -1,5 +1,4 @@
 import torch
-import torch
 from torch import nn
 from torch.nn import functional as F
 from typing import List, Callable, Union, Any, TypeVar, Tuple
@@ -11,14 +10,12 @@ class VanillaVAE(nn.Module):
                  input_dim: int,
                  latent_dim: int,
                  hidden_dims: List = None,
-                 beta=0.1,
                  **kwargs) -> None:
-        super().__init__()
+        super(VanillaVAE, self).__init__()
 
         self.latent_dim = latent_dim
-        self.beta = beta
 
-        # TODO: implement option to normalize inputs to range -1,1 and after decoding (final layer), denormalize back to original domain.
+        self.activation_func = kwargs.get('activation_func', nn.LeakyReLU)
 
         modules = []
         if hidden_dims is None:
@@ -32,13 +29,13 @@ class VanillaVAE(nn.Module):
                     nn.Sequential(
                         nn.Linear(in_dim, h_dim),
                         nn.BatchNorm1d(h_dim),
-                        nn.LeakyReLU())
+                        self.activation_func())
                 )
             else:
                 modules.append(
                     nn.Sequential(
                         nn.Linear(in_dim, h_dim),
-                        nn.LeakyReLU())
+                        self.activation_func())
                 )
             in_dim = h_dim
 
@@ -59,13 +56,13 @@ class VanillaVAE(nn.Module):
                     nn.Sequential(
                         nn.Linear(hidden_dims[i], hidden_dims[i + 1]),
                         nn.BatchNorm1d(hidden_dims[i + 1]),
-                        nn.LeakyReLU())
+                        self.activation_func())
                 )
             else:
                 modules.append(
                     nn.Sequential(
                         nn.Linear(hidden_dims[i], hidden_dims[i + 1]),
-                        nn.LeakyReLU())
+                        self.activation_func())
                 )
 
         self.decoder = nn.Sequential(*modules)
@@ -79,10 +76,6 @@ class VanillaVAE(nn.Module):
         self.final_layer = nn.Sequential(
                             nn.Linear(hidden_dims[-1], input_dim),
                             nn.Tanh())
-
-        # NO TANH:
-        # self.final_layer = nn.Sequential(
-        #                     nn.Linear(hidden_dims[-1], input_dim))
 
     
     def encode(self, input: Tensor) -> List[Tensor]:
@@ -130,16 +123,11 @@ class VanillaVAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return  [self.decode(z), mu, log_var]
 
-    def loss(self, x, x_recon, mu, log_var):
+    def loss(self, x, x_recon, mu, log_var, recon_weight=1, kl_weight=1):
         recon_loss = F.mse_loss(x_recon, x)
         kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-        total_loss = recon_loss + self.beta * kl_loss
-        losses = {
-            'loss': total_loss,
-            'Reconstruction_Loss': recon_loss.detach(),
-            'KLD': kl_loss.detach()
-        }
-        return losses
+        return recon_loss * recon_weight + kl_loss * kl_weight, \
+            recon_loss.detach(), kl_loss.detach()
     
     # def loss_function(self,
     #                   *args,
@@ -179,9 +167,10 @@ class VanillaVAE(nn.Module):
         :param current_device: (Int) Device to run the model
         :return: (Tensor)
         """
-        generator = torch.Generator(device=current_device)
-        generator.manual_seed(10423)
-        z = torch.randn(num_samples, self.latent_dim, device=current_device, generator=generator)
+        z = torch.randn(num_samples,
+                        self.latent_dim)
+
+        z = z.to(current_device)
 
         samples = self.decode(z)
         return samples

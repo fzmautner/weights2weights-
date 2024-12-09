@@ -15,22 +15,35 @@ device = "cuda:0"
 
 # some flag for training and debugging
 normalize_by_10 = True
-batch_norm = True
-run_name = "vanilla-vae-normalizeby10-batchnorm-biggerhidden_dims-epoch15#1"
+batch_norm = False
+# activation = nn.ReLU
+activation = nn.LeakyReLU
+run_name = "vanilla-vae-normalizeby10-supershallow-1rec-scheduleKL#4"
 wandb_flag = True
+recon_loss = 1.0
+kl_loss = 0.01
+
+beta_schedule_flag = True
+beta_schedule = {'start_epoch': 5, 
+                 'end_epoch': 9, 
+                 'pre_start_beta': 0,
+                 'start_beta': 0.001, 
+                 'end_beta': 0.005}
 
 # latent_dim = 32
 # hidden_dims = [1024, 512, 256, 128, 64]
-latent_dim = 128
-hidden_dims = [4096, 2048, 1024, 512, 256]
-epochs = 15
+# latent_dim = 128
+# hidden_dims = [2048, 1024, 512, 256]
+latent_dim = 512
+hidden_dims = [2048 ,1024]
+epochs = 12
 learning_rate = 1e-4
 
-if wandb_flag:
-    wandb.init(
-            project="w2w-proj",
-            name=run_name,
-        )
+train_ratio = 0.8
+test_ratio = 0.1
+val_ratio = 0.1
+batch_size = 64
+
 
 weights_path = '../../w2wfiles/weights_datasets/identities/all_weights.pt'
 all_weights = torch.load(weights_path, map_location=torch.device("cpu"))
@@ -54,11 +67,7 @@ class w2wDataset(Dataset):
         if normalize_by_10:
             return self.all_weights[idx] * 10
         return self.all_weights[idx]
-    
-train_ratio = 0.8
-test_ratio = 0.1
-val_ratio = 0.1
-batch_size = 32
+
 
 # Calculate the sizes of the splits
 train_size = int(train_ratio * len(all_weights))
@@ -78,20 +87,29 @@ in_dim = len(all_weights[0])
 # latent_dim = 32
 # hidden_dims = [1024, 512, 256, 128, 64]
 
-vae = VanillaVAE(in_dim, latent_dim, hidden_dims, batch_norm=batch_norm).to(device)
+vae = VanillaVAE(in_dim, latent_dim, hidden_dims, 
+                 batch_norm=batch_norm, activation_func=activation).to(device)
 vae.train()
 
-def evaluate(dataloader, dataname, vae):
+def evaluate(dataloader, dataname, vae, beta):
     size = len(dataloader.dataset)
     vae.eval()
     avg_loss = 0
+    avg_recon_loss = 0
+    avg_kl_loss = 0
     with torch.no_grad():
         for weights in dataloader:
             weights = weights.to(device)
             recon, mu, log_var = vae(weights)
-            avg_loss += vae.loss(weights, recon, mu, log_var).item()
+            loss, mse, kl = vae.loss(weights, recon, mu, log_var, 
+                                     recon_weight=recon_loss, kl_weight=beta)
+            avg_loss += loss.item() * weights.shape[0]
+            avg_recon_loss += mse.item() * weights.shape[0]
+            avg_kl_loss += kl.item() * weights.shape[0]
     avg_loss /= size
-    print(f"{dataname} avg loss = {avg_loss:>8f}")
+    avg_recon_loss /= size
+    avg_kl_loss /= size
+    print(f"{dataname} avg loss = {avg_loss:>8f}; avg recon loss = {avg_recon_loss:>8f}; avg kl loss = {avg_kl_loss:>8f}")
     return avg_loss
 
 
@@ -100,6 +118,12 @@ optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
 
 vae_save_path = "./outputs/"+run_name+"/"
 os.makedirs(vae_save_path, exist_ok=True)
+
+if wandb_flag:
+    wandb.init(
+            project="w2w-proj",
+            name=run_name,
+        )
 # Training loop
 for epoch in range(epochs):
     vae.train()
@@ -108,8 +132,23 @@ for epoch in range(epochs):
         weights = weights.to(device)
         optimizer.zero_grad()
         recon, mu, log_var = vae(weights)
+
+        if beta_schedule_flag:
+            if epoch < beta_schedule['start_epoch']:
+                beta = beta_schedule['pre_start_beta']
+            elif epoch >= beta_schedule['start_epoch'] and epoch < beta_schedule['end_epoch']:
+                beta = (beta_schedule['end_beta'] - beta_schedule['start_beta']) /\
+                      (beta_schedule['end_epoch'] - beta_schedule['start_epoch']) *\
+                          (epoch - beta_schedule['start_epoch']) \
+                            + beta_schedule['start_beta']
+            else:
+                beta = beta_schedule['end_beta']
+        else:
+            beta = kl_loss
+            
         
-        loss = vae.loss(weights, recon, mu, log_var)
+        loss, mse, kl = vae.loss(weights, recon, mu, log_var, 
+                                 recon_weight=recon_loss, kl_weight=beta)
         loss.backward()
         optimizer.step()
         if i % 500 == 0:
@@ -117,12 +156,14 @@ for epoch in range(epochs):
 
         cur_num_examples += weights.shape[0]
         if wandb_flag:
-            wandb.log({"Loss": loss})
+            wandb.log({"Loss": loss,
+                        "Recon loss": mse,
+                        "KL loss": kl})
 
     print(f"Epoch[{epoch}/{epochs}]")
-    train_avg_loss = evaluate(train_loader, "Train", vae)
-    test_avg_loss = evaluate(test_loader, "Test", vae)
-    val_avg_loss = evaluate(val_loader, "Validation", vae)
+    train_avg_loss = evaluate(train_loader, "Train", vae, beta)
+    test_avg_loss = evaluate(test_loader, "Test", vae, beta)
+    val_avg_loss = evaluate(val_loader, "Validation", vae, beta)
 
     if wandb_flag:
         wandb.log({"Epoch": epoch,
@@ -130,12 +171,12 @@ for epoch in range(epochs):
                     "Test Avg Loss": test_avg_loss,
                     "Validation Avg Loss": val_avg_loss,})
     
-    if epoch != 0 and (epoch+1) % 5 == 0:
+    if epoch != (epochs-1) and (epoch+1) % 3 == 0:
         checkpoint_path = "./outputs/"+run_name+"/"+f"vae_checkpoint_epoch{epoch}.pt"
         checkpoint = {
             'model_state_dict': vae.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'epoch': epoch
+            # 'optimizer_state_dict': optimizer.state_dict(),
+            # 'epoch': epoch
         }
         torch.save(checkpoint, checkpoint_path)
     
