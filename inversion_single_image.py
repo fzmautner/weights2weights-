@@ -21,7 +21,6 @@ def invert_single_image(network, unet, vae, text_encoder, tokenizer, prompt, noi
         }
     )
 
-    # Prepare image
     image = Image.open(image_path).convert('RGB')
     transform = transforms.Compose([
         transforms.Resize(512),
@@ -31,7 +30,6 @@ def invert_single_image(network, unet, vae, text_encoder, tokenizer, prompt, noi
     ])
     image = transform(image).unsqueeze(0).to(device)
     
-    # Prepare mask
     if mask_path:
         mask = Image.open(mask_path)
         mask = transforms.Resize((64,64))(mask)
@@ -39,10 +37,8 @@ def invert_single_image(network, unet, vae, text_encoder, tokenizer, prompt, noi
     else:
         mask = torch.ones((1,1,64,64)).to(device)
     
-    # Optimizer
     optimizer = torch.optim.Adam(network.prepare_optimizer_params(), lr=lr, weight_decay=weight_decay)
     
-    # Training loop
     for epoch in tqdm.tqdm(range(epochs)):
         with torch.no_grad():
             batch = image.to(dtype=torch.bfloat16)
@@ -55,26 +51,21 @@ def invert_single_image(network, unet, vae, text_encoder, tokenizer, prompt, noi
                                  truncation=True, return_tensors="pt")
             text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
         
-        # Forward pass
         model_pred = network(noisy_latents, timesteps, text_embeddings).sample
         
-        # Verify gradients are being tracked
-        assert model_pred.requires_grad, "Model prediction doesn't require gradients!"
+        assert model_pred.requires_grad
         
-        # Compute loss
         loss = torch.nn.functional.mse_loss(
             mask * model_pred.float(), 
             mask * noise.float()
         )
         
-        # Verify loss requires gradients
-        assert loss.requires_grad, "Loss doesn't require gradients!"
+        assert loss.requires_grad
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Log metrics
         wandb.log({"loss": loss.item()})
     
     wandb.finish()
