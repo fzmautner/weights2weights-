@@ -4,12 +4,18 @@ import tqdm
 import torchvision.transforms as transforms
 from PIL import Image
 import warnings
+import wandb
 warnings.filterwarnings("ignore")
 
 
 
 ### run inversion  (optimize PC coefficients) given single image
-def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler, epochs, image_path, mask_path, device, weight_decay = 1e-10, lr=1e-1):
+def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler, epochs, image_path, mask_path, device, wandb_name=None, weight_decay = 1e-10, lr=1e-1):
+
+    if wandb_name is not None:
+        proj = wandb_name['proj']
+        run_name = wandb_name['run']
+        wandb.init(project=proj, name=run_name)
     ### load mask
     if mask_path: 
         mask = Image.open(mask_path)
@@ -52,6 +58,7 @@ def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler,
             with network:
                 model_pred = unet(noisy_latents, timesteps, text_embeddings).sample
                 loss = torch.nn.functional.mse_loss(mask*model_pred.float(), mask*noise.float(), reduction="mean")
+                wandb.log({'loss':loss})
                 optim.zero_grad()
                 loss.backward()
                 optim.step()
