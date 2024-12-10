@@ -101,7 +101,7 @@ class LoRAw2wVAE(nn.Module):
         self.weight_dimensions = torch.load('../files/weight_dimensions.pt')
         
         # Learnable latent vector
-        self.z = nn.Parameter(torch.randn(vae.latent_dim))
+        self.z = nn.Parameter(torch.zeros(vae.latent_dim))
         
         # Create and apply LoRA modules
         # self.unet_loras = self.create_modules(
@@ -282,3 +282,6 @@ class LoRAw2wVAE(nn.Module):
         for lora in self.unet_loras:
             lora.multiplier = 0
             lora.params = None
+
+    def parameters(self):
+        yield self.z
