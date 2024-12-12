@@ -141,63 +141,6 @@ class LoRAw2wVAE(nn.Module):
         
         return False
 
-    # very similar to the one in LoRAw2w: DOES NOT WORK BC ORDER OF PARAMS IS DEF WRONG
-    # def create_modules(self, prefix, root_module, target_replace_modules, rank, multiplier, train_method):
-    #     """Create LoRA modules for target layers and assign parameter slices."""
-    #     counter = 0
-    #     loras = []
-        
-    #     # Get all modules and names
-    #     mm = []
-    #     nn = []
-    #     for name, module in root_module.named_modules():
-    #         nn.append(name)
-    #         mm.append(module)
-        
-    #     # Reorder blocks as in original implementation
-    #     midstart = next(i for i, name in enumerate(nn) if "mid_block" in name)
-    #     upstart = next(i for i, name in enumerate(nn) if "up_block" in name)
-        
-    #     mm = mm[:upstart] + mm[midstart:] + mm[upstart:midstart]
-    #     nn = nn[:upstart] + nn[midstart:] + nn[upstart:midstart]
-        
-    #     for i in range(len(mm)):
-    #         name = nn[i]
-    #         module = mm[i]
-            
-    #         if self._should_skip_module(name, train_method):
-    #             continue
-                
-    #         if module.__class__.__name__ in target_replace_modules:
-    #             for child_name, child_module in module.named_modules():
-    #                 if child_module.__class__.__name__ in ["Linear", "Conv2d"]:
-    #                     lora_name = prefix + "." + name + "." + child_name
-    #                     lora_name = lora_name.replace(".", "_")
-                        
-    #                     # Calculate slice for this module's parameters
-    #                     params_size = child_module.in_features + child_module.out_features
-
-    #                     print(f"Module {lora_name}:")
-    #                     print(f"in_features: {child_module.in_features}")
-    #                     print(f"out_features: {child_module.out_features}")
-    #                     print(f"params_size: {params_size}")
-    #                     print(f"counter before: {counter}")
-
-    #                     slice_indices = slice(counter, counter + params_size)
-    #                     counter += params_size
-                        
-    #                     lora = LoRAVAEModule(
-    #                         lora_name,
-    #                         slice_indices,
-    #                         child_module,
-    #                         multiplier,
-    #                         rank,
-    #                         self.alpha
-    #                     )
-    #                     loras.append(lora)
-
-    #     assert counter == 99648, f"Parameter count mismatch! Got {counter}, expected 99648"
-    #     return loras
     def create_modules(self, unet, train_method):
         loras = []
         counter = 0
@@ -267,11 +210,17 @@ class LoRAw2wVAE(nn.Module):
 
         print("total params counted:", counter)
         return loras
+
+    def apply_latent(self, z=None):
+        if z is not None:
+            self.z.data = z
+        # self.__enter__()
     
     def __enter__(self):
         """Activate LoRA modules with freshly decoded parameters."""
-        params = self.vae.decode(self.z).bfloat16()
-        
+        # print('decoding')
+        params = self.vae.decode(self.z) 
+        params = params.bfloat16() 
         # Distribute parameters and activate modules
         for lora in self.unet_loras:
             lora.params = params  # Each module will use its slice
