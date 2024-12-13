@@ -7,7 +7,13 @@ import warnings
 import wandb
 warnings.filterwarnings("ignore")
 
-def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler, epochs, image_path, mask_path, n_time_steps, device, wandb_name=None, weight_decay=1e-10, lr=1e-4, grad_clip=0.5):
+def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler, epochs, image_path, mask_path, n_time_steps, device,latent_mask, wandb_name=None, weight_decay=1e-10, lr=1e-4, grad_clip=0.5):
+
+    if latent_mask == None:
+        latent_mask = torch.ones(network.vae.latent_dim).to(device)
+
+    latent_mask = latent_mask.to(device)
+
     if mask_path: 
         mask = Image.open(mask_path)
         mask = transforms.Resize((64,64), interpolation=transforms.InterpolationMode.BILINEAR)(mask)
@@ -23,13 +29,14 @@ def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler,
         transforms.Normalize([0.5], [0.5])
     ])
 
+    network.vae.eval()
+
     train_dataset = torchvision.datasets.ImageFolder(root=image_path, transform=image_transforms)
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True) 
+    print("len dataloader:", len(train_dataloader))
 
-    optim = torch.optim.AdamW(network.parameters(), lr=lr, weight_decay=weight_decay)  
+    optim = torch.optim.AdamW([network.z], lr=lr, weight_decay=weight_decay)  
     num_params = sum(param.numel() for param in network.parameters())
-    optimizer_size_bytes = num_params * 2 * 4  # Adam stores 2 values per parameter, each float32 is 4 bytes
-    optimizer_size_mb = optimizer_size_bytes / (1024**2)
     print(f"Total parameters being optimized: {num_params:,}")
 
     wandb_toggle = False
@@ -42,9 +49,8 @@ def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler,
             "n_time_steps": n_time_steps
         })
         wandb_toggle = True
-        
-    noise_scheduler.set_timesteps(50)
-    unet.train()
+    
+    unet.eval()
     for epoch in tqdm.tqdm(range(epochs)):
         epoch_loss = 0.0
         for batch, _ in train_dataloader:
@@ -52,21 +58,12 @@ def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler,
             batch = batch.to(device).bfloat16()
             latents = vae.encode(batch).latent_dist.sample()
             latents = latents * 0.18215
-            
             # Repeat latents n_time_steps times
             latents = latents.repeat(n_time_steps, 1, 1, 1)  # [n_time_steps, 4, 64, 64]
-            
-            # Generate noise
             noise = torch.randn_like(latents)  # Will automatically have the repeated shape
-            
-            # Generate timesteps for each repeated sample
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (n_time_steps,), device=latents.device)
             timesteps = timesteps.long()
-            
-            # Add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            
-            # Get text embeddings and repeat
             text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
             text_embeddings = text_encoder(text_input.input_ids.to(device))[0]  # [1, 77, 768]
             text_embeddings = text_embeddings.repeat(n_time_steps, 1, 1)  # [n_time_steps, 77, 768]
@@ -75,36 +72,16 @@ def invert(network, unet, vae, text_encoder, tokenizer, prompt, noise_scheduler,
             with network:
                 model_pred = unet(noisy_latents, timesteps, text_embeddings).sample
                 if mask_path:
-                    loss = torch.nn.functional.mse_loss(
-                        mask * model_pred.float(), 
-                        mask * noise.float(), 
-                        reduction="mean"
-                    )
+                    loss = torch.nn.functional.mse_loss(mask * model_pred.float(), mask * noise.float(), reduction="mean")
                 else:
-                    loss = torch.nn.functional.mse_loss(
-                        model_pred.float(), 
-                        noise.float(), 
-                        reduction="mean"
-                    )
+                    loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 
                 optim.zero_grad()
                 loss.backward()
-                # Print gradient shapes
-                for name, param in network.named_parameters():
-                    if param.grad is not None:
-                        print(f"Gradient shape for {name}: {param.grad.shape}")
-                        # Store original parameter values
-                        param_before = param.data.clone()
-                
-                torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=grad_clip)
+                # weight or cancel gradients based on variance activity:
+                with torch.no_grad():
+                    network.z.grad.mul_(latent_mask)  # mask or weighted mask
                 optim.step()
-                print()
-                print(f"Total parameters being optimized: {num_params:,}")
-                print()
-                # Print which parameters were actually updated
-                for name, param in network.named_parameters():
-                    if param.grad is not None and not torch.equal(param.data, param_before):
-                        print(f"Parameter {name} was updated, shape: {param.shape}")
             
             epoch_loss += loss.item()
             
