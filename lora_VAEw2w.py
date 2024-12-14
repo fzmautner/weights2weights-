@@ -54,24 +54,21 @@ class LoRAVAEModule(nn.Module):
         self.multiplier = multiplier
         self.org_module = org_module
         
-        # Store dimensions for parameter reshaping
         self.slice_A, self.slice_B = param_slices
         
-        # Alpha scaling as in original LoRA
         self.rank = rank
         alpha = rank if alpha is None or alpha == 0 else alpha
         self.scale = alpha / rank
         
-        # Save original module and its forward pass
         self.org_module = org_module
         self.org_forward = None
-        self.params = None  # Will hold our portion of decoded parameters
+        self.params = None  
 
     def apply_to(self):
-        # Called once during initialization.
+
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
-        del self.org_module  # Remove reference but keep forward pass
+        del self.org_module  
 
     def forward(self, x):
         if self.multiplier == 0 or self.params is None:
@@ -94,6 +91,8 @@ class LoRAw2wVAE(nn.Module):
     def __init__(self, vae, unet, rank=4, multiplier=1.0, alpha=1.0, train_method="full"):
         super().__init__()
         self.vae = vae
+
+        self.vae.decoder.requires_grad = False
         self.multiplier = multiplier
         self.lora_dim = rank
         self.alpha = alpha
@@ -103,15 +102,6 @@ class LoRAw2wVAE(nn.Module):
         # Learnable latent vector
         self.z = nn.Parameter(torch.zeros(vae.latent_dim))
         
-        # Create and apply LoRA modules
-        # self.unet_loras = self.create_modules(
-        #     LORA_PREFIX_UNET,
-        #     unet,
-        #     DEFAULT_TARGET_REPLACE,
-        #     self.lora_dim,
-        #     self.multiplier,
-        #     train_method=train_method
-        # )
         self.unet_loras = self.create_modules(unet, train_method)
         
         # Apply modules to replace forward passes
@@ -145,7 +135,7 @@ class LoRAw2wVAE(nn.Module):
         loras = []
         counter = 0
         
-        # This is basically the same as unflatten
+        # This is basically the same as unflatten from utils.py
         module_pairs = {}
         for key in self.weight_dimensions.keys():
             # Convert the key from lora_unet format to base_model.model format
@@ -174,7 +164,6 @@ class LoRAw2wVAE(nn.Module):
             orig_key_A, diffusers_key_A = pair["A"]
             orig_key_B, diffusers_key_B = pair["B"]
             
-            # UNet module path
             module_path = base_key.replace("base_model.model.", "")
             
             # this should never be called
@@ -208,22 +197,20 @@ class LoRAw2wVAE(nn.Module):
             )
             loras.append(lora)
 
-        print("total params counted:", counter)
+        print("Total parameters counted:", counter)
         return loras
 
     def apply_latent(self, z=None):
         if z is not None:
             self.z.data = z
-        # self.__enter__()
     
     def __enter__(self):
         """Activate LoRA modules with freshly decoded parameters."""
-        # print('decoding')
         params = self.vae.decode(self.z) 
         params = params.bfloat16() 
         # Distribute parameters and activate modules
         for lora in self.unet_loras:
-            lora.params = params  # Each module will use its slice
+            lora.params = params  
             lora.multiplier = self.multiplier
 
     def __exit__(self, exc_type, exc_value, tb):

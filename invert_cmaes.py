@@ -1,8 +1,9 @@
+import torchvision
 import torch
 from torch import nn
 import torchvision.transforms as transforms
 import tqdm
-from utils import load_models, apply_flattened_weights
+from utils import load_models
 import wandb
 from PIL import Image
 import warnings
@@ -18,124 +19,108 @@ from lora_VAEw2w import LoRAw2wVAE
 
 
 '''
-Goal: given a target image, find the latent vector z in the latent space of a VAE whose decoded version best produces the target iamge (minimized denoising objective).
-
-To be more clear, the decoder produces parameters for the LoRA layers of the stable diffusion pipeline. As such, we want to optimize over the latent z to find the best decoded model capable of denoising the target image while being on the dense latent space, preventing it from being out of distribution and overfit to the single target image.
-
-This optimization will define a black-box loss function that takes a latent, decodes it with the VAE, integrates these parameters into the stable diffusion pipeline (the unet) and returns the denoising mse loss of the unet using the decoded parameters.
+This optimization will define a black-box loss function that takes a latent, decodes it with the VAE, integrates these parameters into the stable diffusion pipeline (the unet) and returns the denoising mse loss of the unet using the decoded parameters. The loss function is taken from the standard inversion_vae.py file, and slightly adapted to fit 
+the requirements for using EvoTorch.
 
 To optimize for z, we'll use the CMA-ES algorithm, implemented by EvoTorch.
 
 '''
 
-
-def invert_evo(vae, img_path, mask_path, device, n_epochs=50, n_samples=10, popsize=10, wandb_name=None):
+# generation_idx = 0
+def invert_evo(network, unet, diffusion_vae, text_encoder, tokenizer, prompt, noise_scheduler, image_path, mask_path, n_time_steps, device, n_epochs=50, n_samples=10, popsize=10, wandb_name=None):
 
     # diffusion pipeline models
-    unet, diffusion_vae, text_encoder, tokenizer, noise_scheduler = load_models(device)
+    # unet, diffusion_vae, text_encoder, tokenizer, noise_scheduler = load_models(device)
 
-    latent_dim = vae.latent_dim
+    latent_dim = network.vae.latent_dim
 
-    image = Image.open(img_path).convert('RGB')
-    transform = transforms.Compose([
-        transforms.Resize(512),
-        transforms.CenterCrop(512),
+    if mask_path: 
+        mask = Image.open(mask_path)
+        mask = transforms.Resize((64,64), interpolation=transforms.InterpolationMode.BILINEAR)(mask)
+        mask = torchvision.transforms.functional.pil_to_tensor(mask).unsqueeze(0).to(device).bfloat16()
+        mask = mask.repeat(n_time_steps, 1, 1, 1)  # Repeat along batch dim
+    else: 
+        mask = torch.ones((n_time_steps,1,64,64)).to(device).bfloat16()
+
+    image_transforms = transforms.Compose([
+        transforms.Resize(512, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.RandomCrop(512),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])
     ])
-    image = transform(image).unsqueeze(0).to(device)
-    
-    if mask_path is not None and mask_path != "":
-        mask = Image.open(mask_path)
-        mask = transforms.Resize((64,64))(mask)
-        mask = transforms.functional.pil_to_tensor(mask).unsqueeze(0).to(device)
-    else:
-        mask = torch.ones((1,1,64,64)).to(device)
 
+    train_dataset = torchvision.datasets.ImageFolder(root=image_path, transform=image_transforms)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True) 
     weigth_dimensions = torch.load("../files/weight_dimensions.pt")
     prompt = "sks person"
 
-    network = LoRAw2wVAE(vae, unet, rank=4, multiplier=1.0, alpha=1.0).to(device)
-
-    # def inversion_loss(z: torch.Tensor) -> float:
-    #     # Update network's latent vector
-    #     with torch.no_grad():
-    #         network.z.copy_(z)
-        
-    #     # Aggregate loss across samples
-    #     loss = 0
-    #     for _ in range(n_samples):
-    #         with torch.no_grad():
-    #             batch = image.to(dtype=torch.bfloat16)
-    #             latents = diffusion_vae.encode(batch).latent_dist.sample() * 0.18215
-    #             noise = torch.randn_like(latents)
-    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,), device=device)
-                
-    #             text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, 
-    #                                 truncation=True, return_tensors="pt")
-    #             text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
-            
-    #         # Use network context manager to apply LoRA updates
-    #         with network:
-    #             model_pred = unet(latents, timesteps, text_embeddings).sample
-    #             loss += torch.nn.functional.mse_loss(mask * model_pred.float(), mask * noise.float())
-
-    #     return loss.item() / n_samples
     _n_samples = max(1, n_samples)
 
-    def inversion_loss(z: torch.Tensor) -> float:
-        with torch.no_grad():  # Ensure no gradients are stored
-            network.z.copy_(z)
-            
-            loss = 0
-            # Use smaller number of samples initially, increase later
-            for _ in range(_n_samples):
-                batch = image.to(dtype=torch.bfloat16) 
-                latents = diffusion_vae.encode(batch).latent_dist.sample() * 0.18215
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (1,), device=device)
-                
-                # Clear cache after text encoding
-                text_embeddings = text_encoder(tokenizer(prompt, padding="max_length", 
-                    max_length=tokenizer.model_max_length, truncation=True, 
-                    return_tensors="pt").input_ids.to(device))[0]
-                torch.cuda.empty_cache()
-                
-                with network:
-                    model_pred = unet(latents, timesteps, text_embeddings).sample
-                    curr_loss = torch.nn.functional.mse_loss(
-                        mask * model_pred.float(), 
-                        mask * noise.float()
-                    )
-                    loss += curr_loss.item()  # Convert to item immediately
-                    
-                # Clear cache after each sample
-                torch.cuda.empty_cache()
+    def inversion_loss(_z: torch.Tensor) -> float:
+        with torch.no_grad():  
 
-            return loss / _n_samples
+            network.z.data = _z
+            
+            epoch_loss = 0.0
+            for batch, _ in train_dataloader:
+
+                batch = batch.to(device).bfloat16()
+                latents = diffusion_vae.encode(batch).latent_dist.sample()
+                latents = latents * 0.18215
+                latents = latents.repeat(_n_samples, 1, 1, 1)  # [n_time_steps, 4, 64, 64]
+                noise = torch.randn_like(latents)  # Will automatically have the repeated shape
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (_n_samples,), device=latents.device)
+                
+                timesteps = timesteps.long()
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
+                text_embeddings = text_encoder(text_input.input_ids.to(device))[0]  # [1, 77, 768]
+                text_embeddings = text_embeddings.repeat(_n_samples, 1, 1)  # [n_time_steps, 77, 768]
+                
+                # forward pass with network
+                with network:
+                    model_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+                    if mask_path:
+                        loss = torch.nn.functional.mse_loss(
+                            mask * model_pred.float(), 
+                            mask * noise.float(), 
+                            reduction="mean"
+                        )
+                    else:
+                        loss = torch.nn.functional.mse_loss(
+                            model_pred.float(), 
+                            noise.float(), 
+                            reduction="mean"
+                        )
+                
+                epoch_loss += loss.item()
+
+            return epoch_loss / _n_samples
         
     print('latent dim:', latent_dim)
     problem = Problem(
         "min",  # minimize the objective
         inversion_loss,
-        bounds=(-2.1,2.1), #
+        bounds=(-1.3,1.3), 
         solution_length=latent_dim,
         device=device,
         dtype=torch.float32
     )
 
+    # Uncomment to switch CEM and CMA-ES
+
     # searcher = CEM(
     #     problem=problem,
     #     popsize=popsize,
-    #     parenthood_ratio=0.2, # parenthood_ratio 
-    #     stdev_init=0.05
+    #     parenthood_ratio=0.15, # parenthood_ratio 
+    #     stdev_init=0.5
     # )
-        # initial_mean=torch.zeros(latent_dim, device=device),
+
     searcher = CMAES(
         problem=problem,
-        stdev_init = 0.8,
+        stdev_init = 0.75,
         popsize=popsize,
-        stdev_min = 1e-4,
+        stdev_min = 1e-5,
         stdev_max = 1.5,
         limit_C_decomposition=False
     )
@@ -150,14 +135,13 @@ def invert_evo(vae, img_path, mask_path, device, n_epochs=50, n_samples=10, pops
                 "latent_dim": latent_dim,
             }
         )
-        for epoch in tqdm.tqdm(range(n_epochs)):
+        for _ in tqdm.tqdm(range(n_epochs)):
             searcher.step()
             # print(searcher.status)
             wandb.log({
                 "best_fitness_score": searcher.status['pop_best_eval'],
                 "mean_fitness_score": searcher.status['mean_eval'],
                 "median_fitness_score": searcher.status['median_eval'],
-                # "generation": epoch
             })
         wandb.finish()
     else:
@@ -165,4 +149,5 @@ def invert_evo(vae, img_path, mask_path, device, n_epochs=50, n_samples=10, pops
             searcher.step()
 
     best_potential = searcher.status['pop_best']
+
     return best_potential

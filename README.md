@@ -1,3 +1,10 @@
+# weights2weights++: Constructing the Weight Space for Customized Diffusion Models with VAE (CMU 10423/623 Gen AI)
+
+This is our take on the weights2weights project described below. We leverage the power of a Variational Autoencoder to create a nonlinear latent space of customized diffusion models by using their weights as data. In this repository, we implement our VAE's architecture and training schedule, and some of the tasks presented in the original work, mainly, sampling, interpolation, and single image inversion.
+
+## Acknowledgments
+Our code is based on implementations from the original w2w paper. We want to thank the authors for providing open access to the model weights and all of their code.
+
 # Interpreting the Weight Space of Customized Diffusion Models (*NeurIPS 2024*)
 [[Paper](https://arxiv.org/abs/2406.09413)] [[Project Page](https://snap-research.github.io/weights2weights/)] [[Demo](https://huggingface.co/spaces/snap-research/weights2weights)] [[Files](https://huggingface.co/snap-research/weights2weights)]
 
