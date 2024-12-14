@@ -5,6 +5,11 @@ This is our take on the weights2weights project described below. We leverage the
 ## Acknowledgments
 Our code is based on implementations from the original w2w paper. We want to thank the authors for providing open access to the model weights and all of their code.
 
+## Our contributions
+Our training and generating code is included in `/vae_w2w/`. Specifically, we implement our VAE models including the vanilla version and the one with adversarial loss (see `vanilla_vae.py` and `yuchen_vae.py`). We provide a training script in `train_vanilla_vae.py`. The sampling code is in the `evaluate_trained_model.ipynb`. We implement inversion in `inversion_vae.py`, `inversion_cmaes.py`, and `lora_VAEw2w.py` under the main folder, and the inversion example is in `/vae_w2w/inversion_scrap.ipynb`. We also provide some other useful scripts for visualization and analysis in the same folder. The evaluation protocol, ID-score, is implemented in `/idscore/`.
+
+
+
 # Interpreting the Weight Space of Customized Diffusion Models (*NeurIPS 2024*)
 [[Paper](https://arxiv.org/abs/2406.09413)] [[Project Page](https://snap-research.github.io/weights2weights/)] [[Demo](https://huggingface.co/spaces/snap-research/weights2weights)] [[Files](https://huggingface.co/snap-research/weights2weights)]
 
